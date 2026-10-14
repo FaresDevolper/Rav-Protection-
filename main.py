@@ -25,6 +25,8 @@ RED = 0xE74C3C
 GREEN = 0x2ECC71
 PURPLE = 0x9B59B6
 
+# تعبير منتظم (Regex) لالتقاط الروابط بكافة أنواعها
+URL_REGEX = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+|www\.(?:[-\w.]|(?:%[\da-fA-F]{2}))+')
 
 # ------------------------------------------------------------------
 # Banned words and phrases (قذف وسب الاعراض)
@@ -366,22 +368,75 @@ class ProtectBot(discord.Client):
         member = message.author
         if not isinstance(member, discord.Member) or is_exempt(member):
             return
+
+        # 1. فحص إرسال الروابط ومعاقبة المرسل فوراً
+        if URL_REGEX.search(message.content):
+            await self.punish_link(message, member)
+            return
+
+        # 2. فحص القذف والسب
         hit = matcher.find(message.content)
         if hit:
             await self.punish(message, member, hit)
+
+    async def punish_link(self, message: discord.Message, member: discord.Member):
+        guild = message.guild
+        minutes = cfg.timeout_minutes
+        duration = fmt_duration(minutes)
+
+        # حذف رسالة الرابط فوراً
+        try:
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        timed_out = False
+        try:
+            await member.timeout(timedelta(minutes=minutes), reason="إرسال روابط ممنوعة")
+            timed_out = True
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("could not timeout %s for link", member)
+
+        if timed_out:
+            desc = f"{member.mention} تم منعك من الكتابة لمدة {duration} بسبب إرسال روابط"
+        else:
+            desc = f"{member.mention} تم حذف رسالتك بسبب إرسال روابط"
+        
+        notice = discord.Embed(title="حماية السيرفر", description=desc, color=RED)
+        notice.set_footer(text="إرسال الروابط ممنوع في هذا السيرفر")
+        asyncio.create_task(self.announce(message.channel, member, notice, timed_out))
+
+        if timed_out:
+            try:
+                await member.send(
+                    f"تم منعك من الكتابة في {guild.name} لمدة {duration} بسبب إرسال روابط\n"
+                    "نرجو الالتزام بقوانين السيرفر"
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        # تسجيل المخالفة في اللوج
+        if cfg.log_channel_id:
+            channel = guild.get_channel(cfg.log_channel_id)
+            if channel:
+                embed = discord.Embed(title="سجل الحماية (رابط ممنوع)", color=RED, timestamp=discord.utils.utcnow())
+                embed.set_thumbnail(url=member.display_avatar.url)
+                embed.add_field(name="العضو", value=f"{member.mention}\n{member.id}")
+                embed.add_field(name="القناة", value=message.channel.mention)
+                embed.add_field(name="العقوبة", value=duration if timed_out else "فشل الاسكات")
+                content = discord.utils.escape_markdown(message.content)[:1000]
+                embed.add_field(name="نص الرسالة", value=content, inline=False)
+                try:
+                    await channel.send(embed=embed)
+                except discord.HTTPException:
+                    pass
 
     async def punish(self, message: discord.Message, member: discord.Member, hit: str):
         guild = message.guild
         key = (guild.id, member.id)
         now = time.time()
 
-        # رسائل متتابعة قبل تطبيق التايم اوت: نحذفها فقط بدون تكرار الاشعار
-        if now - self.recent.get(key, 0) < 15:
-            try:
-                await message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-            return
+        # إزالة استثناء الـ 15 ثانية المؤقت حتى يتم حذف الرسالة وإعطاء التايم أوت بشكل دائم وفوري
         self.recent[key] = now
 
         count = register_strike(guild.id, member.id)
@@ -390,6 +445,7 @@ class ProtectBot(discord.Client):
             minutes = min(minutes * (2 ** (min(count, 10) - 1)), MAX_TIMEOUT_MINUTES)
         duration = fmt_duration(minutes)
 
+        # حذف رسالة القذف فوراً
         try:
             await message.delete()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
